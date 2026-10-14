@@ -1,0 +1,57 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - id: ver
+        run: echo "llama=$(sed -n 's/^ARG LLAMA_BUILD=//p' Dockerfile)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:${{ steps.ver.outputs.llama }}
+
+      # Fails if the kisak Mesa did not land, the Intel ICD is missing, or llama-server is broken.
+      - id: smoke
+        run: |
+          set -eu
+          img="${IMAGE}:${{ steps.ver.outputs.llama }}"
+          mesa=$(docker run --rm --entrypoint dpkg-query "$img" -W --showformat '${Version}' mesa-vulkan-drivers)
+          echo "mesa-vulkan-drivers=$mesa"
+          case "$mesa" in *kisak*) ;; *) echo "kisak Mesa not installed" >&2; exit 1;; esac
+          docker run --rm --entrypoint sh "$img" -c 'ls /usr/share/vulkan/icd.d/intel_icd*.json'
+          docker run --rm "$img" --version
+          echo "mesa=$(echo "$mesa" | sed 's/[~-].*//')" >> "$GITHUB_OUTPUT"
+
+      - if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - if: github.event_name != 'pull_request'
+        run: |
+          set -eu
+          src="${IMAGE}:${{ steps.ver.outputs.llama }}"
+          for t in "${{ steps.ver.outputs.llama }}" "${{ steps.ver.outputs.llama }}-mesa${{ steps.smoke.outputs.mesa }}" latest; do
+            docker tag "$src" "${IMAGE}:$t"
+            docker push "${IMAGE}:$t"
+          done
